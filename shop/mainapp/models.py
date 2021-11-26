@@ -1,3 +1,7 @@
+import sys
+from PIL import Image
+
+
 from django.db import models
 # Динамическое получение класса модели пользователя
 from django.contrib.auth import get_user_model
@@ -10,8 +14,52 @@ from django.contrib.contenttypes.models import ContentType
 #  с любой другой моделью в системе , в отличие от ForeignKey ,
 #  которая связана с конкретной моделью.
 from django.contrib.contenttypes.fields import GenericForeignKey
+from django.core.files.uploadedfile import InMemoryUploadedFile
+from django.urls import reverse
+
+from io import BytesIO
 
 User = get_user_model()
+
+def get_product_url(obj, viewname, model_name=None):
+    ct_model = obj.__clas__._meta.model_name
+    return reverse(viewname, kwargs={'ct_model':ct_model, 'slug':obj.slug} )
+
+
+class MinResolutionErrorException(Exception):
+    pass
+
+class MaxResolutionErrorException(Exception):
+    pass
+
+
+class LatestProductsManager:
+    
+    
+# РАЗОБРАТЬ !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    @staticmethod
+    def get_products_for_main_page(*args, **kwargs):
+        with_respect_to = kwargs.get('with_respect_to')
+        products = []
+        ct_models = ContentType.objects.filter(model__in=args)
+        for ct_model in ct_models:
+            model_products = ct_model.model_class()._base_manager.all().order_by('-id')[:5]
+            products.extend(model_products)
+        if with_respect_to:
+            ct_model = ContentType.objects.filter(model=with_respect_to)
+            if ct_model.exists():
+                if with_respect_to in args:
+                    return sorted(
+                        products, key=lambda x: x.__class__._meta.model_name.startswith(with_respect_to), reverse=True
+                                  )
+                
+        return products
+        
+
+
+class LatestProducts:
+    
+    objects = LatestProductsManager()
 
 # ForeignKey - это особый вид поля.
 # Он говорит о том, что здесь мы храним 
@@ -29,7 +77,12 @@ class Category(models.Model):
     def __str__(self):
         return self.name
 
+
 class Product(models.Model):
+    
+    MIN_RESOLUTION = (400,400)
+    MAX_RESOLUTION = (800,800)
+    MAX_IMAGE_SIZE = (3145728)
 
     #  class Meta - Это просто контейнер класса с некоторыми параметрами (метаданными),
     #  прикрепленными к модели. Он определяет такие вещи,
@@ -50,6 +103,29 @@ class Product(models.Model):
     def __str__(self):
         return self.title
 
+    def save(self, *args, **kwargs):
+        # image = self.image
+        # img = Image.open(image)
+        # min_height, min_width = self.MIN_RESOLUTION
+        # max_height, max_width = self.MAX_RESOLUTION
+        # if img.height < min_height or img.width < min_width:
+        #     raise MinResolutionErrorException('Разрешение изображения меньше минимального')
+        # if img.height > max_height or img.width < max_width:
+        #     raise MaxResolutionErrorException('Разрешение изображения больше минимального')
+        image = self.image
+        img = Image.open(image)
+        new_img = img.convert('RGB')
+        resized_new_img = new_img.resize((200, 200), Image.ANTIALIAS)
+        filestream = BytesIO()
+        resized_new_img.save(filestream, 'JPEG', quality=90)
+        filestream.seek(0)
+        name = '{}.{}'.format(*self.image.name.split('.'))
+        self.image = InMemoryUploadedFile(
+            filestream, 'ImageField', name, 'jpeg/image', sys.getsizeof(filestream) , None
+        )
+        super().save(*args, **kwargs)
+    
+
 class Notebook(Product):
 
     diagonal = models.CharField(max_length=255, verbose_name='Диагональ')
@@ -61,6 +137,10 @@ class Notebook(Product):
 
     def __str__(self):
         return "{} : {}".format(self.category.name, self.title)
+    
+    def get_absolute_url(self):
+        return get_product_url(self, 'product_detail')
+
 
 class SmartPhone(Product):
 
@@ -69,14 +149,22 @@ class SmartPhone(Product):
     resolution = models.CharField(max_length=255, verbose_name='Разрешения экрана')
     accum_volume = models.CharField(max_length=255, verbose_name='Объем батареи')
     ram = models.CharField(max_length=255, verbose_name = 'Оперативная память')
-    sd = models.BooleanField(default=True)
-    sd_volume = models.CharField(max_length=255, verbose_name='Максимальный объем встраиваемой памяти')
+    sd = models.BooleanField(default=True, verbose_name='Наличие SD карты')
+    sd_volume = models.CharField(max_length=255,null=True,blank=True, verbose_name='Максимальный объем встраиваемой памяти')
     main_cam_mp = models.CharField(max_length=255, verbose_name='Главная камера')
     frontal_cam_mp = models.CharField(max_length=255, verbose_name='Фронтальная камера')
 
     def __str__(self):
         return "{} : {}".format(self.category.name, self.title)
 
+    def get_absolute_url(self):
+        return get_product_url(self, 'product_detail')
+    
+    # @property
+    # def sd(self):
+    #     if self.sd:
+    #         return 'Да'
+    #     return 'Нет'
 
 class CartProduct(models.Model):
 
@@ -96,7 +184,8 @@ class CartProduct(models.Model):
         # Функция format() в Python используется для
         # создания форматированной строки из строки шаблона
         # и предоставленных значений.
-        return "Продукт: {} (для корзины)".format(self.product.title)
+        return "Продукт: {} (для корзины)".format(self.content_object.title)
+ 
     
 class Cart(models.Model):
 
@@ -106,10 +195,13 @@ class Cart(models.Model):
     products = models.ManyToManyField(CartProduct, blank=True, related_name='related_cart')
     total_products = models.PositiveIntegerField(default=0)
     final_price = models.DecimalField(max_digits=9, decimal_places=2, verbose_name='Общая цена')
-
+    in_order = models.BooleanField(default=False)
+    for_anonymous_user = models.BooleanField(default=False)
+    
     # Cтроковое представления объекта.
     def __str__(self):
         return str(self.id)
+
 
 class Customer(models.Model):
 
